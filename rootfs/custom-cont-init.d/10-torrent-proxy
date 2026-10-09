@@ -2,4 +2,8 @@
 # Ensure libcurl is present (linuxserver Alpine base normally has it).
 apk add --no-cache libcurl >/dev/null 2>&1 || true
 mkdir -p /config/proxy
+# Install the bundled indexer definition (won't overwrite if already customised).
+mkdir -p /config/Definitions/Custom
+[ -f /config/Definitions/Custom/pornolab-noquota.yml ] || \
+    cp /torrent-proxy/pornolab-noquota.yml /config/Definitions/Custom/pornolab-noquota.yml
 echo "[torrent-proxy] ready"

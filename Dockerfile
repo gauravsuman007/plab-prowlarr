@@ -10,3 +10,4 @@ FROM scratch
 COPY --from=builder /torrent-proxy              /usr/local/bin/torrent-proxy
 COPY --from=builder /usr/lib/libcurl.so.4       /usr/lib/libcurl.so.4
 COPY rootfs/                                     /
+COPY pornolab-noquota.yml                        /torrent-proxy/pornolab-noquota.yml

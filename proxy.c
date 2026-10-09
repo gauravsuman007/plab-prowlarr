@@ -9,15 +9,19 @@
  * GET /ann?t=<tok>&…   forward announce with downloaded=0
  * GET /healthz         liveness check
  *
- * Environment:
+ * Environment (all optional — credentials can be passed per-request instead):
  *   PORNOLAB_URL       default https://pornolab.net
- *   PORNOLAB_USERNAME
- *   PORNOLAB_PASSWORD
+ *   PORNOLAB_USERNAME  fallback if not supplied per-request
+ *   PORNOLAB_PASSWORD  fallback if not supplied per-request
  *   PROXY_SELF_URL     base URL qBittorrent uses to reach this proxy
  *                      default http://127.0.0.1:8008
  *   PROXY_PORT         default 8008
  *   PROXY_DATA_DIR     cookie jar directory, default /config/proxy
  *   PROXY_API_KEY      optional; if set, require ?apikey= or X-Api-Key header
+ *
+ * Per-request credentials (preferred — stored in Prowlarr's own config DB):
+ *   GET /dl/<id>?u=<username>&p=<password>
+ *   These override env vars and are never forwarded to trackers.
  */
 
 #define _GNU_SOURCE
@@ -147,9 +151,10 @@ static char *url_encode(const char *s) {
     return curl_easy_escape(g_curl, s, 0);
 }
 
-static int do_login(void) {
-    if (!g_user || !*g_user || !g_pass || !*g_pass) {
-        logf("ERROR: PORNOLAB_USERNAME / PORNOLAB_PASSWORD not set"); return 0;
+/* login with explicit user/pass (overrides env vars) */
+static int do_login_as(const char *user, const char *pass) {
+    if (!user || !*user || !pass || !*pass) {
+        logf("ERROR: no credentials available"); return 0;
     }
     CURL *c = make_curl();
     Buf body = {0};
@@ -174,7 +179,7 @@ static int do_login(void) {
                                              cap_val,  sizeof cap_val);
         if (!*cap_name) snprintf(cap_name, sizeof cap_name, "cap_code_");
 
-        char *eu = url_encode(g_user), *ep = url_encode(g_pass);
+        char *eu = url_encode(user), *ep = url_encode(pass);
         char *ec = url_encode(cap_sid);
         char post[4096];
         snprintf(post, sizeof post,
@@ -202,13 +207,24 @@ fail:
     curl_easy_cleanup(c); free(body.buf); return 0;
 }
 
-/* fetch URL into Buf using shared session; re-login on apparent session loss */
-static int session_get(const char *url, Buf *out) {
+static int do_login(void) {
+    return do_login_as(g_user, g_pass);
+}
+
+/* fetch URL into Buf using shared session.
+ * user/pass: per-request credentials (from ?u=&p=); NULL falls back to env vars. */
+static int session_get(const char *url, Buf *out,
+                       const char *user, const char *pass) {
     pthread_mutex_lock(&g_curl_mtx);
     if (!g_logged_in) {
-        /* try loading cookie jar first */
-        struct stat st; if (stat(g_cookiefile, &st) == 0) g_logged_in = 1;
-        else if (!do_login()) { pthread_mutex_unlock(&g_curl_mtx); return 0; }
+        struct stat st;
+        if (stat(g_cookiefile, &st) == 0) {
+            g_logged_in = 1;
+        } else {
+            const char *u = (user && *user) ? user : g_user;
+            const char *p = (pass && *pass) ? pass : g_pass;
+            if (!do_login_as(u, p)) { pthread_mutex_unlock(&g_curl_mtx); return 0; }
+        }
     }
     curl_easy_setopt(g_curl, CURLOPT_URL,           url);
     curl_easy_setopt(g_curl, CURLOPT_HTTPGET,        1L);
@@ -591,11 +607,16 @@ static void handle_dl(int fd, const char *path, const char *qs,
             return;
         }
 
+    /* per-request credentials from Prowlarr indexer config (?u=…&p=…) */
+    char req_user[256] = {0}, req_pass[256] = {0};
+    qs_get(qs, "u", req_user, sizeof req_user);
+    qs_get(qs, "p", req_pass, sizeof req_pass);
+
     char url[512];
     snprintf(url, sizeof url, "%s/forum/dl.php?t=%s", g_base, id_str);
 
     Buf body = {0};
-    if (!session_get(url, &body)) {
+    if (!session_get(url, &body, req_user, req_pass)) {
         respond(fd, 502, "text/plain", (uint8_t*)"upstream error", 14, NULL);
         return;
     }
