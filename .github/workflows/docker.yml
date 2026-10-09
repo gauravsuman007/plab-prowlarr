@@ -43,22 +43,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/build-push-action@v5
-        id: build
         with:
           context: .
           push: true
           platforms: ${{ matrix.platform }}
-          tags: ${{ env.IMAGE }}:${{ github.sha }}-${{ matrix.tag_suffix }}
+          tags: ${{ env.IMAGE }}:${{ matrix.tag_suffix }}
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to:   type=gha,scope=${{ matrix.platform }},mode=max
-          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
-
-      - run: mkdir -p /tmp/digests && echo "${{ steps.build.outputs.digest }}" > /tmp/digests/${{ matrix.tag_suffix }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: digest-${{ matrix.tag_suffix }}
-          path: /tmp/digests/
-          retention-days: 1
 
   merge:
     runs-on: ubuntu-latest
@@ -74,28 +65,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests
-          merge-multiple: true
-
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=raw,value=latest
-            type=sha
-
-      - uses: docker/buildx-create@v3
-        with:
-          use: true
-
-      - name: Create and push manifest
+      - name: Create multi-arch manifest
         run: |
           docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta.outputs.json }}') \
-            $(cat /tmp/digests/* | xargs -I{} echo "${{ env.IMAGE }}@{}" | tr '\n' ' ')
+            -t ${{ env.IMAGE }}:latest \
+            -t ${{ env.IMAGE }}:${{ github.sha }} \
+            ${{ env.IMAGE }}:amd64 \
+            ${{ env.IMAGE }}:arm64 \
+            ${{ env.IMAGE }}:armv7
 
       - name: Make package public
         run: |
