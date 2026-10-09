@@ -1,0 +1,5 @@
+#!/bin/sh
+# Ensure libcurl is present (linuxserver Alpine base normally has it).
+apk add --no-cache libcurl >/dev/null 2>&1 || true
+mkdir -p /config/proxy
+echo "[torrent-proxy] ready"
