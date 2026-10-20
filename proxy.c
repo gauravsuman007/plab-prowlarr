@@ -18,6 +18,12 @@
  *   PROXY_PORT         default 8008
  *   PROXY_DATA_DIR     cookie jar directory, default /config/proxy
  *   PROXY_API_KEY      optional; if set, require ?apikey= or X-Api-Key header
+ *   ANNOUNCE_PROXY_URL external announce-proxy container (its announce port). When set,
+ *                      announce URLs are registered there and the returned torrent carries
+ *                      ITS url; this process's own /ann is then unused. If the proxy can't
+ *                      be reached the download fails: a torrent is never returned with
+ *                      the real tracker URL in it.
+ *   ANNOUNCE_PROXY_KEY this client's key from the announce-proxy's Clients tab
  *
  * Per-request credentials (preferred — stored in Prowlarr's own config DB):
  *   GET /dl/<id>?u=<username>&p=<password>
@@ -49,6 +55,10 @@ static const char *g_self;        /* PROXY_SELF_URL  */
 static const char *g_data;        /* PROXY_DATA_DIR  */
 static const char *g_apikey;      /* PROXY_API_KEY   */
 static int         g_port;        /* PROXY_PORT      */
+static const char *g_annproxy;    /* ANNOUNCE_PROXY_URL */
+static const char *g_annkey;      /* ANNOUNCE_PROXY_KEY */
+static __thread char t_label[256];       /* account name shown on the announce-proxy dashboard */
+static __thread int  t_rewrite_failed;   /* set when an announce URL could not be proxied */
 static char        g_cookiefile[512];
 
 /* ── logging ─────────────────────────────────────────────────────────────── */
@@ -415,6 +425,40 @@ static const char *lookup_token(const char *tok) {
 
 /* ── announce rewriter ───────────────────────────────────────────────────── */
 
+/* Hand a real announce URL (which carries the passkey) to the external announce-proxy and get
+ * back the URL to put in the torrent instead. Returns 1 and fills `out` on success. The real
+ * URL is deliberately never logged. */
+static int register_remote(const char *real, char *out, size_t outsz) {
+    CURL *c = curl_easy_init();
+    if (!c) return 0;
+    char *eu = curl_easy_escape(c, real, 0);
+    char *el = curl_easy_escape(c, t_label[0] ? t_label : "prowlarr", 0);
+    char endpoint[1024], body[2048], hdr[320];
+    snprintf(endpoint, sizeof endpoint, "%s/v1/register?format=text", g_annproxy);
+    snprintf(body, sizeof body, "url=%s&label=%s", eu ? eu : "", el ? el : "");
+    snprintf(hdr, sizeof hdr, "X-Api-Key: %s", g_annkey);
+    struct curl_slist *h = curl_slist_append(NULL, hdr);
+    Buf resp = {0};
+    curl_easy_setopt(c, CURLOPT_URL,           endpoint);
+    curl_easy_setopt(c, CURLOPT_POSTFIELDS,    body);
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER,    h);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT,       15L);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA,     &resp);
+    CURLcode rc = curl_easy_perform(c);
+    long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    int ok = rc == CURLE_OK && code == 200 && resp.len > 8 && resp.len < outsz &&
+             memcmp(resp.buf, "http", 4) == 0;
+    if (ok) {
+        memcpy(out, resp.buf, resp.len); out[resp.len] = 0;
+        while (resp.len && (out[resp.len - 1] == '\n' || out[resp.len - 1] == '\r')) out[--resp.len] = 0;
+    } else {
+        logf("announce proxy registration failed (curl=%d http=%ld)", (int)rc, code);
+    }
+    curl_free(eu); curl_free(el); curl_slist_free_all(h); curl_easy_cleanup(c); free(resp.buf);
+    return ok;
+}
+
 /* rewrite one announce URL bytes into proxy URL */
 static void rewrite_url(BVal *b) {
     if (b->type != 's') return;
@@ -425,12 +469,18 @@ static void rewrite_url(BVal *b) {
     char orig[512]; size_t ol = b->s.n < 511 ? b->s.n : 511;
     memcpy(orig, b->s.p, ol); orig[ol] = 0;
 
-    char tok[16];
-    /* register_url returns pointer into static array; copy before reuse */
-    memcpy(tok, register_url(orig), 13);
-
     char newurl[640];
-    snprintf(newurl, sizeof newurl, "%s/ann?t=%s", g_self, tok);
+    if (g_annproxy && *g_annproxy) {
+        if (!register_remote(orig, newurl, sizeof newurl)) {
+            t_rewrite_failed = 1;       /* leave the URL alone; handle_dl refuses to return this torrent */
+            return;
+        }
+    } else {
+        char tok[16];
+        /* register_url returns pointer into static array; copy before reuse */
+        memcpy(tok, register_url(orig), 13);
+        snprintf(newurl, sizeof newurl, "%s/ann?t=%s", g_self, tok);
+    }
 
     free(b->s.p);
     b->s.n = strlen(newurl);
@@ -633,9 +683,16 @@ static void handle_dl(int fd, const char *path, const char *qs,
         free(body.buf); return;
     }
 
+    snprintf(t_label, sizeof t_label, "%s", *req_user ? req_user : (*g_user ? g_user : "prowlarr"));
+    t_rewrite_failed = 0;
     size_t outlen = 0;
     uint8_t *out = rewrite_torrent(body.buf, body.len, &outlen);
     free(body.buf);
+    if (out && t_rewrite_failed) {      /* never hand back a torrent that still has the real announce URL */
+        free(out);
+        respond(fd, 502, "text/plain", (uint8_t*)"announce proxy unavailable", 26, NULL);
+        return;
+    }
     if (!out) {
         respond(fd, 502, "text/plain", (uint8_t*)"torrent parse error", 19, NULL);
         return;
@@ -766,6 +823,8 @@ int main(void) {
     g_self   = getenv("PROXY_SELF_URL")    ?: "http://127.0.0.1:8008";
     g_data   = getenv("PROXY_DATA_DIR")    ?: "/config/proxy";
     g_apikey = getenv("PROXY_API_KEY")     ?: "";
+    g_annproxy = getenv("ANNOUNCE_PROXY_URL") ?: "";
+    g_annkey   = getenv("ANNOUNCE_PROXY_KEY") ?: "";
     g_port   = atoi(getenv("PROXY_PORT") ?: "8008");
     if (g_port <= 0 || g_port > 65535) g_port = 8008;
 
