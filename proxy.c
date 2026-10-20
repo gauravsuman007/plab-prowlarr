@@ -24,6 +24,9 @@
  *                      be reached the download fails: a torrent is never returned with
  *                      the real tracker URL in it.
  *   ANNOUNCE_PROXY_KEY this client's key from the announce-proxy's Clients tab
+ *   PORNOLAB_COOKIE    optional: a logged-in Cookie header (e.g. "bb_data=...") copied from a
+ *                      browser. When set the proxy never logs in itself, which sidesteps the
+ *                      login captcha PornoLab sometimes demands.
  *
  * Per-request credentials (preferred — stored in Prowlarr's own config DB):
  *   GET /dl/<id>?u=<username>&p=<password>
@@ -59,6 +62,8 @@ static const char *g_annproxy;    /* ANNOUNCE_PROXY_URL */
 static const char *g_annkey;      /* ANNOUNCE_PROXY_KEY */
 static __thread char t_label[256];       /* account name shown on the announce-proxy dashboard */
 static __thread int  t_rewrite_failed;   /* set when an announce URL could not be proxied */
+static const char *g_cookie;      /* PORNOLAB_COOKIE */
+static __thread char t_login_err[160];   /* why the last login attempt failed, for the HTTP reply */
 static char        g_cookiefile[512];
 
 /* ── logging ─────────────────────────────────────────────────────────────── */
@@ -89,6 +94,17 @@ static size_t curl_write_cb(void *ptr, size_t sz, size_t nmemb, void *ud) {
     buf_append((Buf *)ud, ptr, sz * nmemb); return sz * nmemb;
 }
 
+/* What a PornoLab response is. The pages are Windows-1251, so only ASCII markers are matched. */
+enum { PG_TORRENT, PG_CAPTCHA, PG_LOGIN_FORM, PG_OTHER };
+static int classify_page(const uint8_t *b, size_t n) {
+    if (!b || n == 0) return PG_OTHER;
+    if (n >= 10 && b[0] == 'd' && memmem(b, n < 4096 ? n : 4096, "4:info", 6)) return PG_TORRENT;
+    size_t m = n < 262144 ? n : 262144;
+    if (memmem(b, m, "cap_code_", 9) || memmem(b, m, "/captcha/", 9)) return PG_CAPTCHA;
+    if (memmem(b, m, "login_username", 14)) return PG_LOGIN_FORM;
+    return PG_OTHER;
+}
+
 /* ── session (curl with cookie jar) ─────────────────────────────────────── */
 
 static CURL          *g_curl;
@@ -102,6 +118,7 @@ static CURL *make_curl(void) {
     curl_easy_setopt(c, CURLOPT_TIMEOUT,         30L);
     curl_easy_setopt(c, CURLOPT_COOKIEJAR,       g_cookiefile);
     curl_easy_setopt(c, CURLOPT_COOKIEFILE,      g_cookiefile);
+    if (g_cookie && *g_cookie) curl_easy_setopt(c, CURLOPT_COOKIE, g_cookie);
     return c;
 }
 
@@ -163,7 +180,9 @@ static char *url_encode(const char *s) {
 
 /* login with explicit user/pass (overrides env vars) */
 static int do_login_as(const char *user, const char *pass) {
+    t_login_err[0] = 0;
     if (!user || !*user || !pass || !*pass) {
+        snprintf(t_login_err, sizeof t_login_err, "no PornoLab credentials available");
         logf("ERROR: no credentials available"); return 0;
     }
     CURL *c = make_curl();
@@ -175,7 +194,10 @@ static int do_login_as(const char *user, const char *pass) {
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION,  curl_write_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA,      &body);
     CURLcode rc = curl_easy_perform(c);
-    if (rc != CURLE_OK) { logf("login page fetch: %s", curl_easy_strerror(rc)); goto fail; }
+    if (rc != CURLE_OK) {
+        snprintf(t_login_err, sizeof t_login_err, "could not reach PornoLab");
+        logf("login page fetch: %s", curl_easy_strerror(rc)); goto fail;
+    }
 
     {
         char html[65536]; size_t hl = body.len < sizeof html - 1 ? body.len : sizeof html - 1;
@@ -203,18 +225,46 @@ static int do_login_as(const char *user, const char *pass) {
         curl_easy_setopt(c, CURLOPT_POSTFIELDS, post);
         curl_easy_setopt(c, CURLOPT_WRITEDATA, &body);
         rc = curl_easy_perform(c);
-        if (rc != CURLE_OK) { logf("login post: %s", curl_easy_strerror(rc)); goto fail; }
+        if (rc != CURLE_OK) {
+            snprintf(t_login_err, sizeof t_login_err, "could not reach PornoLab");
+            logf("login post: %s", curl_easy_strerror(rc)); goto fail;
+        }
     }
 
-    curl_easy_cleanup(c); free(body.buf);
-    /* share the cookie jar — recreate global curl to pick up new cookies */
+    /* The page after a successful login carries the logout link. Anything else means the
+     * login was not accepted, however 200 OK the response was. */
+    if (!(body.buf && body.len && memmem(body.buf, body.len, "logout", 6))) {
+        int pg = classify_page(body.buf, body.len);
+        snprintf(t_login_err, sizeof t_login_err, "%s",
+                 pg == PG_CAPTCHA ? "PornoLab demands a captcha at login; log in once from a browser on this network, or set PORNOLAB_COOKIE"
+               : pg == PG_LOGIN_FORM ? "PornoLab rejected the username or password"
+               : "PornoLab login returned an unexpected page");
+        logf("login failed: %s", t_login_err);
+        unlink(g_cookiefile);                 /* never keep a cookie jar from a failed login */
+        goto fail;
+    }
+
+    /* Both handles write the same cookie jar when they are destroyed, and the last one wins.
+     * The old shared handle goes first (it flushes its stale jar), then the login handle, so the
+     * fresh login cookies are what ends up on disk; the new shared handle then reads them. */
     curl_easy_cleanup(g_curl);
+    curl_easy_cleanup(c); free(body.buf);
     g_curl = make_curl();
     g_logged_in = 1;
     logf("logged in to PornoLab");
     return 1;
 fail:
     curl_easy_cleanup(c); free(body.buf); return 0;
+}
+
+/* Drop whatever session we think we have (jar file and the live handle's cookies) so the next
+ * request logs in afresh. */
+static void forget_session(void) {
+    pthread_mutex_lock(&g_curl_mtx);
+    unlink(g_cookiefile);
+    curl_easy_setopt(g_curl, CURLOPT_COOKIELIST, "ALL");
+    g_logged_in = 0;
+    pthread_mutex_unlock(&g_curl_mtx);
 }
 
 static int do_login(void) {
@@ -228,7 +278,9 @@ static int session_get(const char *url, Buf *out,
     pthread_mutex_lock(&g_curl_mtx);
     if (!g_logged_in) {
         struct stat st;
-        if (stat(g_cookiefile, &st) == 0) {
+        if (g_cookie && *g_cookie) {
+            g_logged_in = 1;                  /* PORNOLAB_COOKIE is the session; we never log in ourselves */
+        } else if (stat(g_cookiefile, &st) == 0) {
             g_logged_in = 1;
         } else {
             const char *u = (user && *user) ? user : g_user;
@@ -666,20 +718,41 @@ static void handle_dl(int fd, const char *path, const char *qs,
     snprintf(url, sizeof url, "%s/forum/dl.php?t=%s", g_base, id_str);
 
     Buf body = {0};
-    if (!session_get(url, &body, req_user, req_pass)) {
-        respond(fd, 502, "text/plain", (uint8_t*)"upstream error", 14, NULL);
-        return;
+    int page = PG_OTHER;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        t_login_err[0] = 0;
+        if (!session_get(url, &body, req_user, req_pass)) {
+            const char *why = t_login_err[0] ? t_login_err : "upstream error";
+            respond(fd, t_login_err[0] ? 401 : 502, "text/plain", (uint8_t*)why, strlen(why), NULL);
+            free(body.buf); return;
+        }
+        page = classify_page(body.buf, body.len);
+        if (page == PG_TORRENT) break;
+        /* A login form or captcha where the .torrent should be: the saved session is dead. Start
+         * over once (unless the session came from PORNOLAB_COOKIE, which we can't renew). */
+        if (attempt == 0 && (page == PG_LOGIN_FORM || page == PG_CAPTCHA) && !(g_cookie && *g_cookie)) {
+            logf("saved PornoLab session is not valid any more; logging in again");
+            forget_session(); free(body.buf); body = (Buf){0};
+            continue;
+        }
+        break;
     }
 
-    /* check we got a torrent and not an HTML page */
-    if (body.len < 10 || body.buf[0] != 'd' ||
-        memmem(body.buf, body.len < 4096 ? body.len : 4096,
-               "4:info", 6) == NULL) {
-        int code = memmem(body.buf, body.len < 512 ? body.len : 512,
-                          "limit", 5) ? 429 : 503;
-        respond(fd, code, "text/plain",
-                (uint8_t*)"PornoLab returned a page instead of a .torrent",
-                46, NULL);
+    if (page != PG_TORRENT) {
+        const char *msg; int code;
+        if (g_cookie && *g_cookie && (page == PG_LOGIN_FORM || page == PG_CAPTCHA)) {
+            code = 401; msg = "PORNOLAB_COOKIE is not logged in (expired?)";
+        } else if (page == PG_CAPTCHA) {
+            code = 401; msg = "PornoLab demands a captcha at login; set PORNOLAB_COOKIE or log in from a browser on this network first";
+        } else if (page == PG_LOGIN_FORM) {
+            code = 401; msg = "PornoLab did not accept the login (username/password)";
+        } else if (memmem(body.buf, body.len < 512 ? body.len : 512, "limit", 5)) {
+            code = 429; msg = "PornoLab download limit reached";
+        } else {
+            code = 503; msg = "PornoLab returned a page instead of a .torrent";
+        }
+        logf("download %s refused: %s (page %d, %zu bytes)", id_str, msg, page, body.len);
+        respond(fd, code, "text/plain", (uint8_t*)msg, strlen(msg), NULL);
         free(body.buf); return;
     }
 
@@ -823,6 +896,7 @@ int main(void) {
     g_self   = getenv("PROXY_SELF_URL")    ?: "http://127.0.0.1:8008";
     g_data   = getenv("PROXY_DATA_DIR")    ?: "/config/proxy";
     g_apikey = getenv("PROXY_API_KEY")     ?: "";
+    g_cookie   = getenv("PORNOLAB_COOKIE")     ?: "";
     g_annproxy = getenv("ANNOUNCE_PROXY_URL") ?: "";
     g_annkey   = getenv("ANNOUNCE_PROXY_KEY") ?: "";
     g_port   = atoi(getenv("PROXY_PORT") ?: "8008");
