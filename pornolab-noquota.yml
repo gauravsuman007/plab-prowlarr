@@ -2,6 +2,13 @@
 id: pornolab-noquota
 name: PornoLab (no-download-quota)
 description: "PornoLab — announce URLs rewritten through a local proxy so the tracker never reports downloaded bytes against the account ratio"
+language: ru-RU
+type: private
+encoding: windows-1251
+links:
+  - https://pornolab.net/
+  - https://pornolab.cc/
+  - https://pornolab.biz/
 caps:
   categorymappings:
     - {id: 1670, cat: XXX, desc: "Эротическое видео / Erotic & Softcore"}
@@ -168,17 +175,17 @@ settings:
     label: Sort requested from site
     default: 1
     options:
-      1: created
-      10: seeders
-      7: size
-      2: title
+      "1": created
+      "10": seeders
+      "7": size
+      "2": title
   - name: type
     type: select
     label: Order requested from site
     default: 2
     options:
-      2: desc
-      1: asc
+      "2": desc
+      "1": asc
 
 login:
   path: forum/login.php
@@ -255,7 +262,6 @@ search:
     seeders:
       selector: td.seedmed > b
       optional: true
-      default: 0
     leechers:
       selector: td.leechmed > b
     grabs:
