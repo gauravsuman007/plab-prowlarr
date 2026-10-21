@@ -7,7 +7,8 @@
  *
  * GET /dl/<topic_id>   fetch .torrent, rewrite announces, return bytes
  * GET /ann?t=<tok>&…   forward announce with downloaded=0
- * GET /quota           today's .torrent allowance and the profile's downloaded total (JSON)
+ * GET /quota           today's .torrent allowance and the profile's downloaded total (JSON); loopback only
+ * GET /quota-row       the same as one result row, for the indexer's second search path; loopback only
  * GET /quota/dump      save the profile page's text to <data dir>/profile_dump.txt
  * GET /healthz         liveness check
  *
@@ -19,7 +20,7 @@
  *                      default http://127.0.0.1:8008
  *   PROXY_PORT         default 8008
  *   PROXY_DATA_DIR     cookie jar directory, default /config/proxy
- *   PROXY_API_KEY      optional; if set, callers other than 127.0.0.1 must send ?apikey= or X-Api-Key
+ *   PROXY_API_KEY      optional; if set, /dl and /ann callers other than 127.0.0.1 must send ?apikey= or X-Api-Key
  *   QUOTA_ENFORCE      default 1: /dl answers 429 once today's .torrent allowance is used up; 0 disables
  *   ANNOUNCE_PROXY_URL external announce-proxy container (its announce port). When set,
  *                      announce URLs are registered there and the returned torrent carries
@@ -1079,6 +1080,11 @@ static void handle_dl(int fd, const char *path, const char *qs,
             return;
         }
 
+    if (strcmp(id_str, "0") == 0) {          /* the quota row in the search results; nothing to download */
+        respond(fd, 404, "text/plain", (uint8_t*)"this is the quota row, not a torrent", 37, NULL);
+        return;
+    }
+
     /* per-request credentials from Prowlarr indexer config (?u=…&p=…) */
     char req_user[256] = {0}, req_pass[256] = {0};
     qs_get(qs, "u", req_user, sizeof req_user);
@@ -1183,7 +1189,8 @@ static void handle_dl(int fd, const char *path, const char *qs,
 /* GET /quota[?refresh=1][&u=&p=]   today's allowance and the profile's downloaded total, as JSON
  * GET /quota/dump                   save the profile page's text to <data>/profile_dump.txt (diagnostics) */
 static void handle_quota(int fd, const char *qs, const char *apikey_hdr, int dump) {
-    if (!check_apikey(fd, qs, apikey_hdr)) return;
+    (void)apikey_hdr;
+    if (!t_peer_loopback) { respond(fd, 403, "text/plain", (uint8_t*)"forbidden", 9, NULL); return; }
     char u[256] = {0}, p[256] = {0}, r[8] = {0};
     qs_get(qs, "u", u, sizeof u); qs_get(qs, "p", p, sizeof p); qs_get(qs, "refresh", r, sizeof r);
     const char *user = *u ? u : g_user, *pass = *p ? p : g_pass;
@@ -1216,6 +1223,59 @@ static void handle_quota(int fd, const char *qs, const char *apikey_hdr, int dum
     quota_json(&pr, &q, age, &j);
     respond(fd, 200, "application/json", j.buf, j.len, NULL);
     free(j.buf);
+}
+
+static void human_size(u64 b, char *out, size_t sz) {
+    const char *u[] = {"B", "KB", "MB", "GB", "TB"}; double v = (double)b; int i = 0;
+    while (v >= 1024.0 && i < 4) { v /= 1024.0; i++; }
+    if (i == 0) snprintf(out, sz, "%llu B", b); else snprintf(out, sz, "%.2f %s", v, u[i]);
+}
+
+/* GET /quota-row[?u=&p=]  -- the indexer's second search path.
+ *
+ * Prowlarr merges this page's rows into the results of every search, so the account's daily
+ * allowance travels in the same reply (and under the same Prowlarr API key) as the releases.
+ * It is one fake row laid out like a tracker.php row, so the definition's own selectors read it:
+ *   title    a human sentence plus key=value pairs (left=3 limit=5 used=2 downloaded_bytes=...)
+ *   seeders  downloads left today        leechers  daily limit        grabs  used today
+ *   size     the profile's live downloaded total, in bytes
+ *   date     now (unix)
+ * Its download link is topic 0, which /dl refuses. If the profile can't be read the row still
+ * comes back, saying why, so a search never fails because of the quota. */
+static void handle_quota_row(int fd, const char *qs) {
+    if (!t_peer_loopback) { respond(fd, 403, "text/plain", (uint8_t*)"forbidden", 9, NULL); return; }
+    char u[256] = {0}, p[256] = {0};
+    qs_get(qs, "u", u, sizeof u); qs_get(qs, "p", p, sizeof p);
+    Prof pr; time_t age = 0, now = time(NULL);
+    char title[900]; long long left = 0, limit = 0, used = 0; u64 size = 0;
+    if (get_profile(*u ? u : g_user, *p ? p : g_pass, 0, &pr, &age)) {
+        Quota q = compute_quota(&pr, now);
+        char dl[32]; size = live_downloaded(&pr); human_size(size, dl, sizeof dl);
+        limit = q.tier.limit; used = q.used; left = q.left;
+        char lim_txt[40], left_txt[40];
+        if (q.tier.limit < 0) { snprintf(lim_txt, sizeof lim_txt, "unlimited"); snprintf(left_txt, sizeof left_txt, "unlimited"); }
+        else { snprintf(lim_txt, sizeof lim_txt, "%d", q.tier.limit); snprintf(left_txt, sizeof left_txt, "%d", q.left); }
+        snprintf(title, sizeof title,
+            "PornoLab quota: %s of %s .torrent files left today (used %d) | downloaded %s | tier: %s | "
+            "left=%lld limit=%lld used=%d downloaded_bytes=%llu next_slot_s=%lld",
+            left_txt, lim_txt, q.used, dl, q.tier.name, left, limit, q.used, size, q.wait_s);
+        if (q.tier.limit < 0) { left = 0; limit = 0; }
+    } else {
+        snprintf(title, sizeof title, "PornoLab quota: unavailable (%s) | left=unknown",
+                 t_login_err[0] ? t_login_err : "profile could not be read");
+    }
+    /* ASCII only, and nothing that needs escaping beyond '&' and '<' (none are produced above). */
+    char html[2600];
+    int n = snprintf(html, sizeof html,
+        "<html><body><div class=\"topmenu\"><a onclick=\"return logout()\">logout</a></div>"
+        "<table id=\"tor-tbl\"><tbody><tr>"
+        "<td></td><td><a class=\"f\" href=\"tracker.php?f=1670\">quota</a></td>"
+        "<td><a class=\"tLink\" href=\"viewtopic.php?t=0\">%s</a></td><td></td>"
+        "<td><a class=\"tr-dl\" href=\"dl.php?t=0\">quota</a></td>"
+        "<td><u>%llu</u></td><td class=\"seedmed\"><b>%lld</b></td><td class=\"leechmed\"><b>%lld</b></td>"
+        "<td>%lld</td><td></td><td><u>%lld</u></td></tr></tbody></table></body></html>",
+        title, size, left < 0 ? 0 : left, limit, used, (long long)now);
+    respond(fd, 200, "text/html; charset=windows-1251", (uint8_t*)html, (size_t)n, NULL);
 }
 
 static void handle_ann(int fd, const char *qs) {
@@ -1319,6 +1379,8 @@ static void *handle_conn(void *arg) {
         handle_dl(fd, raw_path, qs, apikey_hdr[0] ? apikey_hdr : NULL);
     } else if (strcmp(raw_path, "/quota") == 0 || strcmp(raw_path, "/quota/dump") == 0) {
         handle_quota(fd, qs, apikey_hdr[0] ? apikey_hdr : NULL, strcmp(raw_path, "/quota/dump") == 0);
+    } else if (strcmp(raw_path, "/quota-row") == 0) {
+        handle_quota_row(fd, qs);
     } else if (strcmp(raw_path, "/ann") == 0) {
         handle_ann(fd, qs);
     } else {

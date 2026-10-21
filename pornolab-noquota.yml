@@ -214,6 +214,12 @@ login:
 search:
   paths:
     - path: forum/tracker.php
+    # The account's daily .torrent allowance, as one extra result (see the sidecar's /quota-row):
+    # seeders = downloads left today, leechers = daily limit, grabs = used today, size = total
+    # downloaded (bytes), and the title carries the same numbers as key=value pairs. It is merged
+    # into every search reply, so it travels under Prowlarr's own API key.
+    - path: "http://127.0.0.1:8008/quota-row?u={{ .Config.username }}&p={{ .Config.password }}"
+      inheritinputs: false
   inputs:
     $raw: "{{ if .Categories }}{{ range .Categories }}f[]={{.}}&{{end}}{{ else }}f[]=-1{{ end }}"
     o: "{{ .Config.sort }}"
