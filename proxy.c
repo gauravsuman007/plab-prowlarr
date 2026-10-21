@@ -28,6 +28,13 @@
  *                      be reached the download fails: a torrent is never returned with
  *                      the real tracker URL in it.
  *   ANNOUNCE_PROXY_KEY this client's key from the announce-proxy's Clients tab
+ *   Session: by default the sidecar borrows the PornoLab session Prowlarr itself holds (its saved
+ *   cookies for the indexer, read from <PROWLARR_CONFIG_DIR>/prowlarr.db, default /config), so it
+ *   never has to log in or solve a login captcha; PROWLARR_SESSION=0 turns that off. It also sends
+ *   what Prowlarr sends: its User-Agent ("Prowlarr/<version> (<os> <version>)", read from Prowlarr's
+ *   own status API, override with PORNOLAB_USER_AGENT), Accept-Encoding, Connection: close, a
+ *   traceparent header, and no Accept header. Order of preference for the session:
+ *   PORNOLAB_COOKIE, then Prowlarr's cookies, then the sidecar's own login.
  *   PORNOLAB_COOKIE    optional: a logged-in Cookie header (e.g. "bb_data=...") copied from a
  *                      browser. When set the proxy never logs in itself, which sidesteps the
  *                      login captcha PornoLab sometimes demands.
@@ -43,6 +50,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <sqlite3.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -67,6 +75,14 @@ static const char *g_annkey;      /* ANNOUNCE_PROXY_KEY */
 static __thread char t_label[256];       /* account name shown on the announce-proxy dashboard */
 static __thread int  t_rewrite_failed;   /* set when an announce URL could not be proxied */
 static const char *g_cookie;      /* PORNOLAB_COOKIE */
+static const char *g_prowlarr_dir;       /* PROWLARR_CONFIG_DIR (default /config) */
+static int         g_use_prowlarr_session = 1;   /* PROWLARR_SESSION=0 disables */
+static const char *g_ua_override;        /* PORNOLAB_USER_AGENT */
+static char        g_ua[200];            /* Prowlarr's own User-Agent, once known */
+static time_t      g_ua_at;
+static char        g_refused_cookie[1500];   /* the Prowlarr cookie header the site last rejected: skip exactly that one */
+static char        g_last_borrowed[1500];    /* the Prowlarr cookie header used for the latest request */
+static pthread_mutex_t g_ua_mtx = PTHREAD_MUTEX_INITIALIZER;
 static int         g_quota_enforce = 1;   /* QUOTA_ENFORCE=0 turns the refusal off (the /quota endpoint stays) */
 static __thread int t_peer_loopback;      /* this connection came from 127.0.0.1 */
 static __thread char t_login_err[160];   /* why the last login attempt failed, for the HTTP reply */
@@ -119,9 +135,12 @@ static int             g_logged_in = 0;
 
 static CURL *make_curl(void) {
     CURL *c = curl_easy_init();
-    curl_easy_setopt(c, CURLOPT_USERAGENT,      "Mozilla/5.0");
+    curl_easy_setopt(c, CURLOPT_USERAGENT,      g_ua[0] ? g_ua : "Mozilla/5.0");
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION,  1L);
     curl_easy_setopt(c, CURLOPT_TIMEOUT,         30L);
+    curl_easy_setopt(c, CURLOPT_FORBID_REUSE,    1L);          /* Prowlarr sends Connection: close */
+    curl_version_info_data *vi = curl_version_info(CURLVERSION_NOW);
+    curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, (vi && (vi->features & CURL_VERSION_BROTLI)) ? "gzip, br" : "gzip");
     curl_easy_setopt(c, CURLOPT_COOKIEJAR,       g_cookiefile);
     curl_easy_setopt(c, CURLOPT_COOKIEFILE,      g_cookiefile);
     if (g_cookie && *g_cookie) curl_easy_setopt(c, CURLOPT_COOKIE, g_cookie);
@@ -184,6 +203,9 @@ static char *url_encode(const char *s) {
     return curl_easy_escape(g_curl, s, 0);
 }
 
+static struct curl_slist *prowlarr_like_headers(void);
+static void ensure_ua(void);
+
 /* login with explicit user/pass (overrides env vars) */
 static int do_login_as(const char *user, const char *pass) {
     t_login_err[0] = 0;
@@ -192,6 +214,10 @@ static int do_login_as(const char *user, const char *pass) {
         logf("ERROR: no credentials available"); return 0;
     }
     CURL *c = make_curl();
+    ensure_ua();
+    if (g_ua[0]) curl_easy_setopt(c, CURLOPT_USERAGENT, g_ua);
+    struct curl_slist *lh = prowlarr_like_headers();       /* the same request headers as Prowlarr */
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, lh);
     Buf body = {0};
     char url[1024]; snprintf(url, sizeof url, "%s/forum/login.php", g_base);
 
@@ -254,18 +280,19 @@ static int do_login_as(const char *user, const char *pass) {
      * The old shared handle goes first (it flushes its stale jar), then the login handle, so the
      * fresh login cookies are what ends up on disk; the new shared handle then reads them. */
     curl_easy_cleanup(g_curl);
-    curl_easy_cleanup(c); free(body.buf);
+    curl_easy_cleanup(c); curl_slist_free_all(lh); free(body.buf);
     g_curl = make_curl();
     g_logged_in = 1;
     logf("logged in to PornoLab");
     return 1;
 fail:
-    curl_easy_cleanup(c); free(body.buf); return 0;
+    curl_easy_cleanup(c); curl_slist_free_all(lh); free(body.buf); return 0;
 }
 
 /* Drop whatever session we think we have (jar file and the live handle's cookies) so the next
  * request logs in afresh. */
 static void forget_session(void) {
+    snprintf(g_refused_cookie, sizeof g_refused_cookie, "%s", g_last_borrowed);   /* if that was Prowlarr's session, don't reuse that exact cookie */
     pthread_mutex_lock(&g_curl_mtx);
     unlink(g_cookiefile);
     curl_easy_setopt(g_curl, CURLOPT_COOKIELIST, "ALL");
@@ -277,15 +304,155 @@ static int do_login(void) {
     return do_login_as(g_user, g_pass);
 }
 
+/* ── borrowing Prowlarr's identity ───────────────────────────────────────── */
+
+/* Parse the next JSON string at p (which points at its opening quote) into out, unescaping. */
+static const char *json_string(const char *p, char *out, size_t sz) {
+    size_t k = 0; p++;
+    while (*p && *p != '"') {
+        char c = *p++;
+        if (c == '\\' && *p) {
+            char e = *p++;
+            if (e == 'u' && p[0] && p[1] && p[2] && p[3]) { char h[5] = {p[0], p[1], p[2], p[3], 0}; c = (char)strtol(h, NULL, 16); p += 4; }
+            else c = e == 'n' ? '\n' : e == 't' ? '\t' : e;     /* \" \\ \/ come through as themselves */
+        }
+        if (k + 1 < sz) out[k++] = c;
+    }
+    out[k] = 0;
+    return *p == '"' ? p + 1 : p;
+}
+
+/* Value of a top-level-looking "key": "value" pair anywhere in a JSON text (spaces around ':' allowed). */
+static int json_find_string(const char *j, const char *key, char *out, size_t sz) {
+    char pat[64]; snprintf(pat, sizeof pat, "\"%s\"", key);
+    for (const char *q = j; (q = strstr(q, pat)); q += strlen(pat)) {
+        const char *v = q + strlen(pat);
+        while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r') v++;
+        if (*v != ':') continue;
+        v++; while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r') v++;
+        if (*v != '"') continue;
+        json_string(v, out, sz); return 1;
+    }
+    out[0] = 0; return 0;
+}
+
+/* The PornoLab session cookies Prowlarr saved for its indexer (IndexerStatus.Cookies), as a
+ * Cookie header. Returns 0 if there are none, they have expired, or the site refused them lately. */
+static int prowlarr_cookie_header(char *out, size_t sz) {
+    out[0] = 0;
+    time_t now = time(NULL);
+    if (!g_use_prowlarr_session) return 0;
+    char path[600]; snprintf(path, sizeof path, "%s/prowlarr.db", g_prowlarr_dir);
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) { if (db) sqlite3_close(db); return 0; }
+    sqlite3_busy_timeout(db, 1500);
+    sqlite3_stmt *st = NULL; int ok = 0;
+    if (sqlite3_prepare_v2(db,
+            "select s.Cookies, s.CookiesExpirationDate from IndexerStatus s join Indexers i on i.Id = s.ProviderId "
+            "where instr(i.Settings, 'pornolab') > 0 and s.Cookies is not null and length(s.Cookies) > 2 "
+            "order by s.CookiesExpirationDate desc limit 1", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) {
+        const char *json = (const char *)sqlite3_column_text(st, 0);
+        const char *exp  = (const char *)sqlite3_column_text(st, 1);
+        char nowstr[24]; struct tm tmv; gmtime_r(&now, &tmv); strftime(nowstr, sizeof nowstr, "%Y-%m-%d %H:%M:%S", &tmv);
+        int expired = exp && strlen(exp) >= 19 && strncmp(exp, nowstr, 19) < 0;
+        if (json && !expired) {
+            size_t n = 0;
+            for (const char *p = json; (p = strchr(p, '"')); ) {
+                char key[128], val[1024];
+                p = json_string(p, key, sizeof key);
+                while (*p == ' ' || *p == ':') p++;
+                if (*p != '"') continue;                       /* not a string value */
+                p = json_string(p, val, sizeof val);
+                n += (size_t)snprintf(out + n, n < sz ? sz - n : 0, "%s%s=%s", n ? "; " : "", key, val);
+                if (n + 1 >= sz) { n = sz - 1; break; }
+            }
+            ok = n > 0;
+        }
+    }
+    if (st) sqlite3_finalize(st);
+    sqlite3_close(db);
+    if (ok && g_refused_cookie[0] && strcmp(out, g_refused_cookie) == 0) { out[0] = 0; ok = 0; }   /* the site already said no to this one */
+    static int announced = -1;
+    if (announced != ok) { announced = ok; logf(ok ? "using the PornoLab session saved by Prowlarr" : "no usable Prowlarr session for PornoLab; falling back"); }
+    return ok;
+}
+
+/* Prowlarr's User-Agent is "Prowlarr/<version> (<os> <os version>)"; its own status API has the three
+ * parts. Refreshed hourly. PORNOLAB_USER_AGENT overrides. */
+static void ensure_ua(void) {
+    pthread_mutex_lock(&g_ua_mtx);
+    time_t now = time(NULL);
+    if (g_ua_override && *g_ua_override) { snprintf(g_ua, sizeof g_ua, "%s", g_ua_override); pthread_mutex_unlock(&g_ua_mtx); return; }
+    if (g_ua[0] && now - g_ua_at < 3600) { pthread_mutex_unlock(&g_ua_mtx); return; }
+    g_ua_at = now;                                    /* don't retry on every request if Prowlarr is unreachable */
+    char cfg[600]; snprintf(cfg, sizeof cfg, "%s/config.xml", g_prowlarr_dir);
+    FILE *f = fopen(cfg, "r");
+    if (f) {
+        char xml[8192]; size_t n = fread(xml, 1, sizeof xml - 1, f); xml[n] = 0; fclose(f);
+        char key[80] = "", port[8] = "9696", base[80] = "";
+        const char *a;
+        if ((a = strstr(xml, "<ApiKey>"))) { a += 8; size_t k = strcspn(a, "<"); if (k < sizeof key) { memcpy(key, a, k); key[k] = 0; } }
+        if ((a = strstr(xml, "<Port>")))    { a += 6; size_t k = strcspn(a, "<"); if (k < sizeof port) { memcpy(port, a, k); port[k] = 0; } }
+        if ((a = strstr(xml, "<UrlBase>"))) { a += 9; size_t k = strcspn(a, "<"); if (k < sizeof base) { memcpy(base, a, k); base[k] = 0; } }
+        if (key[0]) {
+            char url[300], hdr[120]; Buf body = {0};
+            snprintf(url, sizeof url, "http://127.0.0.1:%s%s%s/api/v1/system/status", port, base[0] && base[0] != '/' ? "/" : "", base);
+            snprintf(hdr, sizeof hdr, "X-Api-Key: %s", key);
+            CURL *c = curl_easy_init(); struct curl_slist *h = curl_slist_append(NULL, hdr);
+            curl_easy_setopt(c, CURLOPT_URL, url); curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
+            curl_easy_setopt(c, CURLOPT_TIMEOUT, 4L); curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write_cb);
+            curl_easy_setopt(c, CURLOPT_WRITEDATA, &body);
+            if (curl_easy_perform(c) == CURLE_OK && body.len) {
+                buf_append(&body, "\0", 1);
+                char ver[40] = "", os[40] = "", osv[40] = ""; const char *j = (const char *)body.buf;
+                const char *q;
+                json_find_string(j, "version", ver, sizeof ver);
+                json_find_string(j, "osName", os, sizeof os);
+                json_find_string(j, "osVersion", osv, sizeof osv);
+                if (ver[0]) {
+                    if (os[0] && osv[0]) snprintf(g_ua, sizeof g_ua, "Prowlarr/%s (%s %s)", ver, os, osv);
+                    else snprintf(g_ua, sizeof g_ua, "Prowlarr/%s", ver);
+                    logf("using Prowlarr's User-Agent: %s", g_ua);
+                }
+            }
+            curl_slist_free_all(h); curl_easy_cleanup(c); free(body.buf);
+        }
+    }
+    pthread_mutex_unlock(&g_ua_mtx);
+}
+
+static void random_hex(char *out, size_t nbytes) {            /* out gets 2*nbytes hex chars + NUL */
+    uint8_t b[16]; FILE *f = fopen("/dev/urandom", "rb");
+    if (!f || fread(b, 1, nbytes, f) != nbytes) for (size_t i = 0; i < nbytes; i++) b[i] = (uint8_t)rand();
+    if (f) fclose(f);
+    for (size_t i = 0; i < nbytes; i++) snprintf(out + 2 * i, 3, "%02x", b[i]);
+}
+
+/* The request headers Prowlarr sends (no Accept, Connection: close, a fresh W3C traceparent). */
+static struct curl_slist *prowlarr_like_headers(void) {
+    char tid[33], sid[17], tp[80];
+    random_hex(tid, 16); random_hex(sid, 8);
+    snprintf(tp, sizeof tp, "traceparent: 00-%s-%s-00", tid, sid);
+    struct curl_slist *hl = curl_slist_append(NULL, "Accept:");
+    hl = curl_slist_append(hl, "Connection: close");
+    return curl_slist_append(hl, tp);
+}
+
 /* fetch URL into Buf using shared session.
  * user/pass: per-request credentials (from ?u=&p=); NULL falls back to env vars. */
 static int session_get(const char *url, Buf *out,
                        const char *user, const char *pass) {
+    ensure_ua();
+    /* Whose session? PORNOLAB_COOKIE, else the one Prowlarr saved, else our own login. */
+    char borrowed[1500]; int use_prowlarr = 0;
+    if (!(g_cookie && *g_cookie)) use_prowlarr = prowlarr_cookie_header(borrowed, sizeof borrowed);
     pthread_mutex_lock(&g_curl_mtx);
     if (!g_logged_in) {
         struct stat st;
         if (g_cookie && *g_cookie) {
             g_logged_in = 1;                  /* PORNOLAB_COOKIE is the session; we never log in ourselves */
+        } else if (use_prowlarr) {
+            g_logged_in = 1;
         } else if (stat(g_cookiefile, &st) == 0) {
             g_logged_in = 1;
         } else {
@@ -294,11 +461,23 @@ static int session_get(const char *url, Buf *out,
             if (!do_login_as(u, p)) { pthread_mutex_unlock(&g_curl_mtx); return 0; }
         }
     }
+    snprintf(g_last_borrowed, sizeof g_last_borrowed, "%s", use_prowlarr ? borrowed : "");
+    if (use_prowlarr) {                       /* exactly Prowlarr's cookies, nothing left over from other sessions */
+        curl_easy_setopt(g_curl, CURLOPT_COOKIELIST, "ALL");
+        curl_easy_setopt(g_curl, CURLOPT_COOKIE, borrowed);
+    } else if (!(g_cookie && *g_cookie)) {
+        curl_easy_setopt(g_curl, CURLOPT_COOKIE, NULL);
+    }
+    if (g_ua[0]) curl_easy_setopt(g_curl, CURLOPT_USERAGENT, g_ua);
+    struct curl_slist *hl = prowlarr_like_headers();
+    curl_easy_setopt(g_curl, CURLOPT_HTTPHEADER,    hl);
     curl_easy_setopt(g_curl, CURLOPT_URL,           url);
     curl_easy_setopt(g_curl, CURLOPT_HTTPGET,        1L);
     curl_easy_setopt(g_curl, CURLOPT_WRITEFUNCTION,  curl_write_cb);
     curl_easy_setopt(g_curl, CURLOPT_WRITEDATA,      out);
     CURLcode rc = curl_easy_perform(g_curl);
+    curl_easy_setopt(g_curl, CURLOPT_HTTPHEADER, NULL);
+    curl_slist_free_all(hl);
     pthread_mutex_unlock(&g_curl_mtx);
     if (rc != CURLE_OK) { logf("GET %s: %s", url, curl_easy_strerror(rc)); return 0; }
     return 1;
@@ -1401,6 +1580,9 @@ int main(void) {
     g_data   = getenv("PROXY_DATA_DIR")    ?: "/config/proxy";
     g_apikey = getenv("PROXY_API_KEY")     ?: "";
     g_cookie   = getenv("PORNOLAB_COOKIE")     ?: "";
+    g_prowlarr_dir = getenv("PROWLARR_CONFIG_DIR") ?: "/config";
+    g_use_prowlarr_session = !(getenv("PROWLARR_SESSION") && strcmp(getenv("PROWLARR_SESSION"), "0") == 0);
+    g_ua_override = getenv("PORNOLAB_USER_AGENT") ?: "";
     g_quota_enforce = !(getenv("QUOTA_ENFORCE") && strcmp(getenv("QUOTA_ENFORCE"), "0") == 0);
     g_annproxy = getenv("ANNOUNCE_PROXY_URL") ?: "";
     g_annkey   = getenv("ANNOUNCE_PROXY_KEY") ?: "";
