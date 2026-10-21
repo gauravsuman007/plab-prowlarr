@@ -553,7 +553,7 @@ static void html_to_text(const uint8_t *in, size_t n, Buf *out) {
                 }
             }
         }
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == 0xA0) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == 0xA0 || c < 0x20) {   /* control bytes (a stray NUL!) count as a space */
             if (!last_space) { buf_append(out, " ", 1); last_space = 1; }
         } else { put_utf8(out, cp1251_cp(c)); last_space = 0; }
         i++;
@@ -611,11 +611,22 @@ static int lit(const char **pp, const char *s) {       /* skip spaces, then requ
     *pp = p + l; return 1;
 }
 
-static int plain_int_end(const char *p) {              /* the digits just read are not part of "12.5 GB" */
+static int is_unit_at(const char *p) {                 /* TB | GB | MB | KB | B, as a whole word */
+    static const char *u[] = {"TB", "GB", "MB", "KB", "B"};
+    for (size_t i = 0; i < sizeof u / sizeof *u; i++) {
+        size_t l = strlen(u[i]);
+        if (strncasecmp(p, u[i], l) == 0) {
+            char n = p[l];
+            if (!((n >= 'A' && n <= 'Z') || (n >= 'a' && n <= 'z') || (n >= '0' && n <= '9'))) return 1;
+        }
+    }
+    return 0;
+}
+
+static int plain_int_end(const char *p) {              /* the digits just read are a bare byte count, not "12.5 GB" */
     p = sk(p);
     if (*p == '.' || *p == ',') return 0;
-    if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z')) return 0;
-    return 1;
+    return !is_unit_at(p);
 }
 
 static void parse_row(const char *table, const char *label, Stat *st) {
