@@ -490,6 +490,7 @@ static int session_get(const char *url, Buf *out,
  * ordinary strings, the same way the seeder's Python parser reads the visible text. */
 static void put_utf8(Buf *o, unsigned cp) {
     uint8_t b[3];
+    if (cp == 0) return;                      /* a NUL in the text would end every strstr early */
     if (cp < 0x80)       { b[0] = (uint8_t)cp; buf_append(o, b, 1); }
     else if (cp < 0x800) { b[0] = 0xC0 | (cp >> 6); b[1] = 0x80 | (cp & 63); buf_append(o, b, 2); }
     else                 { b[0] = 0xE0 | (cp >> 12); b[1] = 0x80 | ((cp >> 6) & 63); b[2] = 0x80 | (cp & 63); buf_append(o, b, 3); }
@@ -544,10 +545,11 @@ static void html_to_text(const uint8_t *in, size_t n, Buf *out) {
                 else if (!strcmp(ent, "lt")) cp = '<';
                 else if (!strcmp(ent, "gt")) cp = '>';
                 else if (!strcmp(ent, "quot")) cp = '"';
-                else if (ent[0] == '#' && ent[1]) cp = (unsigned)atoi(ent + 1);
+                else if (ent[0] == '#' && (ent[1] == 'x' || ent[1] == 'X')) cp = (unsigned)strtoul(ent + 2, NULL, 16);   /* &#x2022; */
+                else if (ent[0] == '#' && ent[1]) cp = (unsigned)strtoul(ent + 1, NULL, 10);
                 else known = 0;
                 if (known) {
-                    if (cp == ' ' || cp == 160) { if (!last_space) { buf_append(out, " ", 1); last_space = 1; } }
+                    if (cp < 0x21 || cp == 160) { if (!last_space) { buf_append(out, " ", 1); last_space = 1; } }   /* never a NUL or control char */
                     else { put_utf8(out, cp); last_space = 0; }
                     i = j + 1; continue;
                 }

@@ -28,6 +28,13 @@ int main(void) {
     check(strstr((char *)b.buf, "bob") != NULL, "text after a NUL byte survives html_to_text (cp1251 label decoded)");
     free(b.buf);
 
+    /* 2b. numeric entities, decimal and hex ('&#x2022;' used to decode as 0 = a NUL), never produce a NUL */
+    const char ent[] = "<p>a&#x2022;b &#8226; c&#0;d&#x0;e&nbsp;f &amp; g</p>";
+    Buf e = {0}; html_to_text((const uint8_t *)ent, sizeof ent - 1, &e);
+    check(strlen((char *)e.buf) == e.len - 1, "entities never put a NUL inside the text");
+    check(strstr((char *)e.buf, "a\xE2\x80\xA2" "b") != NULL && strstr((char *)e.buf, "& g") != NULL, "hex and decimal entities decoded");
+    free(e.buf);
+
     /* 3. tiers */
     Prof q; memset(&q, 0, sizeof q);
     q.newbie = 1; check(tier_of(&q).limit == 5, "newbie banner -> 5");
