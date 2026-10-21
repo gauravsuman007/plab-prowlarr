@@ -7,6 +7,8 @@
  *
  * GET /dl/<topic_id>   fetch .torrent, rewrite announces, return bytes
  * GET /ann?t=<tok>&…   forward announce with downloaded=0
+ * GET /quota           today's .torrent allowance and the profile's downloaded total (JSON)
+ * GET /quota/dump      save the profile page's text to <data dir>/profile_dump.txt
  * GET /healthz         liveness check
  *
  * Environment (all optional — credentials can be passed per-request instead):
@@ -17,7 +19,8 @@
  *                      default http://127.0.0.1:8008
  *   PROXY_PORT         default 8008
  *   PROXY_DATA_DIR     cookie jar directory, default /config/proxy
- *   PROXY_API_KEY      optional; if set, require ?apikey= or X-Api-Key header
+ *   PROXY_API_KEY      optional; if set, callers other than 127.0.0.1 must send ?apikey= or X-Api-Key
+ *   QUOTA_ENFORCE      default 1: /dl answers 429 once today's .torrent allowance is used up; 0 disables
  *   ANNOUNCE_PROXY_URL external announce-proxy container (its announce port). When set,
  *                      announce URLs are registered there and the returned torrent carries
  *                      ITS url; this process's own /ann is then unused. If the proxy can't
@@ -63,6 +66,8 @@ static const char *g_annkey;      /* ANNOUNCE_PROXY_KEY */
 static __thread char t_label[256];       /* account name shown on the announce-proxy dashboard */
 static __thread int  t_rewrite_failed;   /* set when an announce URL could not be proxied */
 static const char *g_cookie;      /* PORNOLAB_COOKIE */
+static int         g_quota_enforce = 1;   /* QUOTA_ENFORCE=0 turns the refusal off (the /quota endpoint stays) */
+static __thread int t_peer_loopback;      /* this connection came from 127.0.0.1 */
 static __thread char t_login_err[160];   /* why the last login attempt failed, for the HTTP reply */
 static char        g_cookiefile[512];
 
@@ -296,6 +301,369 @@ static int session_get(const char *url, Buf *out,
     pthread_mutex_unlock(&g_curl_mtx);
     if (rc != CURLE_OK) { logf("GET %s: %s", url, curl_easy_strerror(rc)); return 0; }
     return 1;
+}
+
+/* ── profile and the daily .torrent quota ────────────────────────────────── */
+
+/* PornoLab's pages are windows-1251. Turn one into plain UTF-8 text (tags, scripts and styles
+ * dropped, entities decoded, whitespace collapsed) so the labels below can be matched as
+ * ordinary strings, the same way the seeder's Python parser reads the visible text. */
+static void put_utf8(Buf *o, unsigned cp) {
+    uint8_t b[3];
+    if (cp < 0x80)       { b[0] = (uint8_t)cp; buf_append(o, b, 1); }
+    else if (cp < 0x800) { b[0] = 0xC0 | (cp >> 6); b[1] = 0x80 | (cp & 63); buf_append(o, b, 2); }
+    else                 { b[0] = 0xE0 | (cp >> 12); b[1] = 0x80 | ((cp >> 6) & 63); b[2] = 0x80 | (cp & 63); buf_append(o, b, 3); }
+}
+
+static unsigned cp1251_cp(uint8_t c) {
+    if (c < 0x80) return c;
+    if (c >= 0xC0) return 0x410 + (c - 0xC0);
+    switch (c) {
+    case 0xA8: return 0x401;  case 0xB8: return 0x451;  case 0xA0: return ' ';
+    case 0xAB: return 0xAB;   case 0xBB: return 0xBB;   case 0x96: return 0x2013;
+    case 0x97: return 0x2014; case 0x85: return 0x2026; case 0xB9: return 0x2116;
+    }
+    return '?';
+}
+
+static const uint8_t *find_ci(const uint8_t *h, size_t n, const char *needle) {
+    size_t m = strlen(needle);
+    for (size_t i = 0; i + m <= n; i++)
+        if (strncasecmp((const char *)h + i, needle, m) == 0) return h + i;
+    return NULL;
+}
+
+static void html_to_text(const uint8_t *in, size_t n, Buf *out) {
+    int last_space = 1;
+    for (size_t i = 0; i < n;) {
+        uint8_t c = in[i];
+        if (c == '<') {
+            const char *skip_to = NULL;
+            if (i + 7 <= n && strncasecmp((const char *)in + i + 1, "script", 6) == 0) skip_to = "</script";
+            else if (i + 6 <= n && strncasecmp((const char *)in + i + 1, "style", 5) == 0) skip_to = "</style";
+            const uint8_t *e = memchr(in + i, '>', n - i);
+            size_t next = e ? (size_t)(e - in) + 1 : n;
+            if (skip_to) {
+                const uint8_t *close = find_ci(in + next, n - next, skip_to);
+                const uint8_t *ce = close ? memchr(close, '>', n - (size_t)(close - in)) : NULL;
+                next = ce ? (size_t)(ce - in) + 1 : n;
+            }
+            i = next;
+            if (!last_space) { buf_append(out, " ", 1); last_space = 1; }
+            continue;
+        }
+        if (c == '&') {
+            size_t j = i + 1;
+            while (j < n && j - i < 9 && in[j] != ';' && in[j] != ' ' && in[j] != '<') j++;
+            if (j < n && in[j] == ';') {
+                char ent[12]; size_t el = j - i - 1; if (el >= sizeof ent) el = sizeof ent - 1;
+                memcpy(ent, in + i + 1, el); ent[el] = 0;
+                unsigned cp = 0; int known = 1;
+                if (!strcmp(ent, "nbsp")) cp = ' ';
+                else if (!strcmp(ent, "amp")) cp = '&';
+                else if (!strcmp(ent, "lt")) cp = '<';
+                else if (!strcmp(ent, "gt")) cp = '>';
+                else if (!strcmp(ent, "quot")) cp = '"';
+                else if (ent[0] == '#' && ent[1]) cp = (unsigned)atoi(ent + 1);
+                else known = 0;
+                if (known) {
+                    if (cp == ' ' || cp == 160) { if (!last_space) { buf_append(out, " ", 1); last_space = 1; } }
+                    else { put_utf8(out, cp); last_space = 0; }
+                    i = j + 1; continue;
+                }
+            }
+        }
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == 0xA0) {
+            if (!last_space) { buf_append(out, " ", 1); last_space = 1; }
+        } else { put_utf8(out, cp1251_cp(c)); last_space = 0; }
+        i++;
+    }
+    buf_append(out, "\0", 1);
+}
+
+typedef unsigned long long u64;
+typedef struct { u64 last, today, yesterday, total; } Stat;
+typedef struct {
+    char username[64];
+    double rating; int has_rating;
+    int newbie;
+    u64 uploaded, uploaded_own, uploaded_bonus, downloaded;
+    Stat down, up, own, bonus;
+} Prof;
+
+static const char *sk(const char *p) { while (*p == ' ') p++; return p; }
+
+static int parse_dbl(const char **pp, double *v) {
+    const char *p = sk(*pp);
+    if (!(*p >= '0' && *p <= '9')) return 0;
+    char tmp[40]; size_t k = 0;
+    while (k < sizeof tmp - 1 && ((*p >= '0' && *p <= '9') || *p == '.' || *p == ',')) { tmp[k++] = *p == ',' ? '.' : *p; p++; }
+    tmp[k] = 0; *v = strtod(tmp, NULL); *pp = p; return 1;
+}
+
+static int parse_u64(const char **pp, u64 *v) {
+    const char *p = sk(*pp);
+    if (!(*p >= '0' && *p <= '9')) return 0;
+    *v = 0;
+    while (*p >= '0' && *p <= '9') { *v = *v * 10 + (u64)(*p - '0'); p++; }
+    *pp = p; return 1;
+}
+
+/* '989.7 MB' -> bytes. PornoLab's units are binary. */
+static int parse_size(const char **pp, u64 *out) {
+    const char *p = *pp; double v;
+    if (!parse_dbl(&p, &v)) return 0;
+    p = sk(p);
+    static const struct { const char *u; double m; } units[] = {
+        {"TB", 1099511627776.0}, {"GB", 1073741824.0}, {"MB", 1048576.0}, {"KB", 1024.0}, {"B", 1.0}};
+    for (size_t i = 0; i < sizeof units / sizeof *units; i++) {
+        size_t ul = strlen(units[i].u);
+        if (strncasecmp(p, units[i].u, ul) == 0 && !((p[ul] >= 'A' && p[ul] <= 'Z') || (p[ul] >= 'a' && p[ul] <= 'z') || (p[ul] >= '0' && p[ul] <= '9'))) {
+            *out = (u64)(v * units[i].m); *pp = p + ul; return 1;
+        }
+    }
+    return 0;
+}
+
+static int lit(const char **pp, const char *s) {       /* skip spaces, then require the literal */
+    const char *p = sk(*pp); size_t l = strlen(s);
+    if (strncmp(p, s, l) != 0) return 0;
+    *pp = p + l; return 1;
+}
+
+static int plain_int_end(const char *p) {              /* the digits just read are not part of "12.5 GB" */
+    p = sk(p);
+    if (*p == '.' || *p == ',') return 0;
+    if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z')) return 0;
+    return 1;
+}
+
+static void parse_row(const char *table, const char *label, Stat *st) {
+    memset(st, 0, sizeof *st);
+    const char *p = strstr(table, label);
+    if (!p) return;
+    p += strlen(label);
+    u64 v[4];
+    for (int i = 0; i < 4; i++) if (!parse_size(&p, &v[i])) return;
+    st->last = v[0]; st->today = v[1]; st->yesterday = v[2]; st->total = v[3];
+}
+
+static void parse_profile_text(const char *text, Prof *pr) {
+    memset(pr, 0, sizeof *pr);
+    const char *p;
+    if ((p = strstr(text, "Профиль пользователя:"))) {
+        p = sk(p + strlen("Профиль пользователя:")); size_t k = 0;
+        while (*p && *p != ' ' && k < sizeof pr->username - 1) pr->username[k++] = *p++;
+    }
+    if ((p = strstr(text, "Рейтинг:"))) {
+        p += strlen("Рейтинг:");
+        if (parse_dbl(&p, &pr->rating)) pr->has_rating = 1;
+    }
+    if ((p = strstr(text, "После 2"))) {
+        p += strlen("После 2");
+        if (lit(&p, "GB скачанного")) pr->newbie = 1;
+    }
+    /* The formula appears twice: once with units, once in raw bytes. Only the bytes one counts. */
+    for (const char *q = text; (q = strstr(q, "Всего отдано")); q += 3) {
+        const char *c = q + strlen("Всего отдано"); u64 a, b, d, e;
+        if (!parse_u64(&c, &a) || !plain_int_end(c)) continue;
+        if (!lit(&c, "+") || !lit(&c, "на своих раздачах") || !parse_u64(&c, &b) || !plain_int_end(c)) continue;
+        if (!lit(&c, "+") || !lit(&c, "бонусных") || !parse_u64(&c, &d) || !plain_int_end(c)) continue;
+        if (!lit(&c, ")") || !lit(&c, "/") || !lit(&c, "Скачано") || !parse_u64(&c, &e) || !plain_int_end(c)) continue;
+        pr->uploaded = a; pr->uploaded_own = b; pr->uploaded_bonus = d; pr->downloaded = e;
+        break;
+    }
+    const char *table = strstr(text, "Посл. обновл.");
+    if (table) {
+        parse_row(table, "Скачано", &pr->down); parse_row(table, "Отдано", &pr->up);
+        parse_row(table, "На своих", &pr->own);  parse_row(table, "Бонус", &pr->bonus);
+    }
+    if (!pr->downloaded) pr->downloaded = pr->down.total;
+}
+
+/* Downloaded as of the last stats update, plus today's: the number the site's own rules use.
+ * (Same definition as the seeder's Profile.live_downloaded.) */
+static u64 live_downloaded(const Prof *pr) {
+    return (pr->downloaded > pr->down.total ? pr->downloaded : pr->down.total) + pr->down.today;
+}
+
+static u64 credited_upload(const Prof *pr) { return pr->uploaded + pr->uploaded_own + pr->uploaded_bonus; }
+
+typedef struct { const char *name; int limit; } Tier;      /* limit < 0: unlimited */
+
+/* The site's rating FAQ: how many .torrent files an account may fetch per day. Same table as
+ * the seeder's app/limits.py. (Group members are unlimited; that can't be seen from here.) */
+static Tier tier_of(const Prof *pr) {
+    const u64 GB = 1073741824ULL, NEWBIE_CEILING = 2000000000ULL;
+    if (pr->newbie || live_downloaded(pr) < NEWBIE_CEILING) return (Tier){"newbie", 5};
+    double r = pr->has_rating ? pr->rating : 0.0;
+    if (r >= 1.0) return credited_upload(pr) >= 100 * GB ? (Tier){"rating >= 1.0, 100 GB+ up", 100} : (Tier){"rating >= 1.0", 50};
+    if (r >= 0.5) return (Tier){"rating 0.5-1.0", 50};
+    if (r >= 0.3) return (Tier){"rating 0.3-0.5", 10};
+    return (Tier){"rating < 0.3", 0};
+}
+
+/* ── the sidecar's own count of .torrent files fetched (rolling 24 hours) ── */
+
+static pthread_mutex_t g_quota_mtx = PTHREAD_MUTEX_INITIALIZER;
+static time_t g_site_refused_at = 0;                        /* when PornoLab itself last said "limit" */
+
+static void data_path(char *out, size_t sz, const char *name) { snprintf(out, sz, "%s/%s", g_data, name); }
+
+/* Count fetches in the last 24h and find the oldest of them. Caller holds g_quota_mtx. */
+static int ledger_used(time_t now, time_t *oldest) {
+    char path[600]; data_path(path, sizeof path, "dl_ledger.txt");
+    FILE *f = fopen(path, "r"); int n = 0; *oldest = 0;
+    if (!f) return 0;
+    long long t;
+    while (fscanf(f, "%lld", &t) == 1)
+        if (now - (time_t)t < 86400) { n++; if (!*oldest || (time_t)t < *oldest) *oldest = (time_t)t; }
+    fclose(f); return n;
+}
+
+static void ledger_add(time_t now) {
+    pthread_mutex_lock(&g_quota_mtx);
+    char path[600], tmp[620], total_path[600];
+    data_path(path, sizeof path, "dl_ledger.txt"); snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *in = fopen(path, "r"), *out = fopen(tmp, "w");
+    if (out) {
+        long long t;
+        while (in && fscanf(in, "%lld", &t) == 1) if (now - (time_t)t < 86400) fprintf(out, "%lld\n", t);
+        fprintf(out, "%lld\n", (long long)now);
+        fclose(out); rename(tmp, path);
+    }
+    if (in) fclose(in);
+    data_path(total_path, sizeof total_path, "dl_total.txt");
+    long long total = 0; FILE *tf = fopen(total_path, "r");
+    if (tf) { if (fscanf(tf, "%lld", &total) != 1) total = 0; fclose(tf); }
+    tf = fopen(total_path, "w"); if (tf) { fprintf(tf, "%lld\n", total + 1); fclose(tf); }
+    pthread_mutex_unlock(&g_quota_mtx);
+}
+
+static long long ledger_lifetime(void) {
+    char p[600]; data_path(p, sizeof p, "dl_total.txt");
+    FILE *f = fopen(p, "r"); long long n = 0;
+    if (f) { if (fscanf(f, "%lld", &n) != 1) n = 0; fclose(f); }
+    return n;
+}
+
+static void note_site_refusal(time_t now) {
+    pthread_mutex_lock(&g_quota_mtx); g_site_refused_at = now; pthread_mutex_unlock(&g_quota_mtx);
+}
+
+/* ── the profile, fetched with the logged-in session and cached for a few minutes ── */
+
+#define PROFILE_TTL_S 600
+static pthread_mutex_t g_prof_mtx = PTHREAD_MUTEX_INITIALIZER;
+static Prof   g_prof;
+static time_t g_prof_at = 0;
+static char   g_uid[24];
+
+static int logged_in_page(const Buf *b) {
+    return b->buf && b->len && memmem(b->buf, b->len, "logout", 6) && !memmem(b->buf, b->len, "login_username", 14);
+}
+
+/* Fetch the profile page and (optionally) keep its text. Returns 1 on success; on failure
+ * t_login_err or a short reason is set. Caller holds g_prof_mtx. */
+static int fetch_profile(const char *user, const char *pass, Prof *out, Buf *text_out) {
+    t_login_err[0] = 0;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        Buf page = {0};
+        if (!g_uid[0]) {                                   /* the profile id is in the top menu of any logged-in page */
+            char url[512]; snprintf(url, sizeof url, "%s/forum/index.php", g_base);
+            if (!session_get(url, &page, user, pass)) { free(page.buf); return 0; }
+            const char *m = page.buf && page.len ? (const char *)memmem(page.buf, page.len, "profile.php?mode=viewprofile&", 29) : NULL;
+            if (m) {
+                m += 29; if (strncmp(m, "amp;", 4) == 0) m += 4;
+                if (m[0] == 'u' && m[1] == '=') { size_t k = 0; m += 2; while (*m >= '0' && *m <= '9' && k < sizeof g_uid - 1) g_uid[k++] = *m++; g_uid[k] = 0; }
+            }
+            if (!g_uid[0]) {
+                int dead = !logged_in_page(&page);
+                free(page.buf);
+                if (dead && attempt == 0 && !(g_cookie && *g_cookie)) { forget_session(); continue; }
+                snprintf(t_login_err, sizeof t_login_err, dead ? "not logged in to PornoLab" : "could not find the profile link");
+                return 0;
+            }
+            free(page.buf); page = (Buf){0};
+        }
+        char url[512]; snprintf(url, sizeof url, "%s/forum/profile.php?mode=viewprofile&u=%s", g_base, g_uid);
+        if (!session_get(url, &page, user, pass)) { free(page.buf); return 0; }
+        if (!logged_in_page(&page)) {
+            free(page.buf);
+            if (attempt == 0 && !(g_cookie && *g_cookie)) { forget_session(); continue; }
+            snprintf(t_login_err, sizeof t_login_err, "not logged in to PornoLab");
+            return 0;
+        }
+        Buf text = {0};
+        html_to_text(page.buf, page.len, &text);
+        free(page.buf);
+        parse_profile_text((const char *)text.buf, out);
+        if (text_out) { *text_out = text; } else free(text.buf);
+        return 1;
+    }
+    return 0;
+}
+
+static int get_profile(const char *user, const char *pass, int force, Prof *out, time_t *age) {
+    pthread_mutex_lock(&g_prof_mtx);
+    time_t now = time(NULL);
+    if (!force && g_prof_at && now - g_prof_at < PROFILE_TTL_S) {
+        *out = g_prof; *age = now - g_prof_at; pthread_mutex_unlock(&g_prof_mtx); return 1;
+    }
+    Prof fresh;
+    int ok = fetch_profile(user, pass, &fresh, NULL);
+    if (ok) { g_prof = fresh; g_prof_at = now; *out = fresh; *age = 0; }
+    pthread_mutex_unlock(&g_prof_mtx);
+    return ok;
+}
+
+/* Where we stand today. */
+typedef struct { Tier tier; int used; int left; long long wait_s; int refused_by_site; } Quota;
+
+static Quota compute_quota(const Prof *pr, time_t now) {
+    Quota q; q.tier = tier_of(pr);
+    time_t oldest = 0;
+    pthread_mutex_lock(&g_quota_mtx);
+    q.used = ledger_used(now, &oldest);
+    time_t refused = g_site_refused_at;
+    pthread_mutex_unlock(&g_quota_mtx);
+    q.refused_by_site = refused && now - refused < 3600;           /* the site said no recently: hold off an hour */
+    q.left = q.tier.limit < 0 ? -1 : (q.used >= q.tier.limit ? 0 : q.tier.limit - q.used);
+    q.wait_s = 0;
+    if (q.tier.limit >= 0 && q.left == 0) q.wait_s = q.tier.limit == 0 ? 0 : (long long)(oldest + 86400 - now);
+    if (q.refused_by_site) { q.left = 0; long long w = (long long)(refused + 3600 - now); if (w > q.wait_s) q.wait_s = w; }
+    if (q.wait_s < 0) q.wait_s = 0;
+    return q;
+}
+
+static void json_str(char *out, size_t sz, const char *s) {        /* username is the only free text; keep it safe */
+    size_t k = 0; for (; *s && k + 2 < sz; s++) if (*s != '"' && *s != '\\' && (uint8_t)*s >= 0x20) out[k++] = *s;
+    out[k] = 0;
+}
+
+static void quota_json(const Prof *pr, const Quota *q, time_t age, Buf *out) {
+    char u[96], lim[24], left[24], rating[24], b[1800];
+    json_str(u, sizeof u, pr->username);
+    if (q->tier.limit < 0) snprintf(lim, sizeof lim, "null"); else snprintf(lim, sizeof lim, "%d", q->tier.limit);
+    if (q->left < 0) snprintf(left, sizeof left, "null"); else snprintf(left, sizeof left, "%d", q->left);
+    if (pr->has_rating) snprintf(rating, sizeof rating, "%.3f", pr->rating); else snprintf(rating, sizeof rating, "null");
+    u64 dl_total = pr->downloaded > pr->down.total ? pr->downloaded : pr->down.total;
+    snprintf(b, sizeof b,
+        "{\"ok\":true,\"username\":\"%s\",\"tier\":\"%s\","
+        "\"daily_limit\":%s,\"used_today\":%d,\"left\":%s,\"unlimited\":%s,"
+        "\"next_slot_in_s\":%lld,\"refused_by_site_recently\":%s,"
+        "\"downloaded_bytes\":%llu,\"downloaded_today_bytes\":%llu,\"downloaded_bytes_last_update\":%llu,"
+        "\"uploaded_credited_bytes\":%llu,\"rating\":%s,"
+        "\"torrent_files_fetched_total\":%lld,\"profile_age_s\":%lld,"
+        "\"count_source\":\"sidecar\","
+        "\"note\":\"used_today counts .torrent files fetched through this sidecar in the last 24h; "
+        "downloads made elsewhere with the same account are not included. downloaded_bytes is the profile's "
+        "live total (last update + today).\"}",
+        u, q->tier.name, lim, q->used, left, q->tier.limit < 0 ? "true" : "false",
+        q->wait_s, q->refused_by_site ? "true" : "false",
+        live_downloaded(pr), pr->down.today, dl_total, credited_upload(pr), rating,
+        ledger_lifetime(), (long long)age);
+    buf_appendz(out, b);
 }
 
 /* ── bencode ─────────────────────────────────────────────────────────────── */
@@ -646,6 +1014,7 @@ static void respond(int fd, int code, const char *ctype,
     const char *reason = code == 200 ? "OK"
                        : code == 204 ? "No Content"
                        : code == 400 ? "Bad Request"
+                       : code == 401 ? "Unauthorized"
                        : code == 403 ? "Forbidden"
                        : code == 404 ? "Not Found"
                        : code == 429 ? "Too Many Requests"
@@ -689,6 +1058,7 @@ static int qs_get(const char *qs, const char *key,
 /* check API key if configured; return 1 if OK */
 static int check_apikey(int fd, const char *qs, const char *apikey_hdr) {
     if (!g_apikey || !*g_apikey) return 1;
+    if (t_peer_loopback) return 1;       /* Prowlarr calls us on 127.0.0.1; the key is for everyone else */
     char k[256];
     if (qs_get(qs, "apikey", k, sizeof k) && strcmp(k, g_apikey) == 0) return 1;
     if (apikey_hdr && strcmp(apikey_hdr, g_apikey) == 0) return 1;
@@ -714,6 +1084,32 @@ static void handle_dl(int fd, const char *path, const char *qs,
     qs_get(qs, "u", req_user, sizeof req_user);
     qs_get(qs, "p", req_pass, sizeof req_pass);
 
+    if (g_quota_enforce) {
+        /* Don't spend a request the site would refuse (or that would put the account at risk)
+         * once today's allowance is used up. If the profile can't be read, let the fetch decide. */
+        Prof qp; time_t age = 0, now = time(NULL);
+        if (get_profile(*req_user ? req_user : g_user, *req_pass ? req_pass : g_pass, 0, &qp, &age)) {
+            Quota q = compute_quota(&qp, now);
+            if (q.tier.limit >= 0 && q.left == 0) {
+                char msg[240], hdr[64];
+                long long w = q.wait_s > 0 ? q.wait_s : 3600;
+                if (q.tier.limit == 0)
+                    snprintf(msg, sizeof msg, "PornoLab downloads are blocked for this account (%s)", q.tier.name);
+                else if (q.refused_by_site)
+                    snprintf(msg, sizeof msg, "PornoLab refused a download recently; holding off, retry in %lldm", (w + 59) / 60);
+                else
+                    snprintf(msg, sizeof msg, "PornoLab daily .torrent limit reached (%d of %d used); next slot in %lldh%02lldm",
+                             q.used, q.tier.limit, w / 3600, (w % 3600) / 60);
+                snprintf(hdr, sizeof hdr, "Retry-After: %lld\r\n", w);
+                logf("download %s refused by quota: %s", id_str, msg);
+                respond(fd, 429, "text/plain", (uint8_t*)msg, strlen(msg), hdr);
+                return;
+            }
+        } else {
+            logf("quota check skipped: %s", t_login_err[0] ? t_login_err : "profile unavailable");
+        }
+    }
+
     char url[512];
     snprintf(url, sizeof url, "%s/forum/dl.php?t=%s", g_base, id_str);
 
@@ -738,6 +1134,8 @@ static void handle_dl(int fd, const char *path, const char *qs,
         break;
     }
 
+    if (page == PG_TORRENT) ledger_add(time(NULL));         /* the site counted this fetch against the day */
+
     if (page != PG_TORRENT) {
         const char *msg; int code;
         if (g_cookie && *g_cookie && (page == PG_LOGIN_FORM || page == PG_CAPTCHA)) {
@@ -746,8 +1144,11 @@ static void handle_dl(int fd, const char *path, const char *qs,
             code = 401; msg = "PornoLab demands a captcha at login; set PORNOLAB_COOKIE or log in from a browser on this network first";
         } else if (page == PG_LOGIN_FORM) {
             code = 401; msg = "PornoLab did not accept the login (username/password)";
-        } else if (memmem(body.buf, body.len < 512 ? body.len : 512, "limit", 5)) {
+        } else if (body.buf && (memmem(body.buf, body.len < 4096 ? body.len : 4096, "limit", 5) ||
+                                memmem(body.buf, body.len < 4096 ? body.len : 4096, "\xEB\xE8\xEC\xE8\xF2", 5) ||   /* "лимит" (cp1251) */
+                                memmem(body.buf, body.len < 4096 ? body.len : 4096, "\xCB\xE8\xEC\xE8\xF2", 5))) {   /* "Лимит" */
             code = 429; msg = "PornoLab download limit reached";
+            note_site_refusal(time(NULL));
         } else {
             code = 503; msg = "PornoLab returned a page instead of a .torrent";
         }
@@ -777,6 +1178,44 @@ static void handle_dl(int fd, const char *path, const char *qs,
              id_str);
     respond(fd, 200, "application/x-bittorrent", out, outlen, disp);
     free(out);
+}
+
+/* GET /quota[?refresh=1][&u=&p=]   today's allowance and the profile's downloaded total, as JSON
+ * GET /quota/dump                   save the profile page's text to <data>/profile_dump.txt (diagnostics) */
+static void handle_quota(int fd, const char *qs, const char *apikey_hdr, int dump) {
+    if (!check_apikey(fd, qs, apikey_hdr)) return;
+    char u[256] = {0}, p[256] = {0}, r[8] = {0};
+    qs_get(qs, "u", u, sizeof u); qs_get(qs, "p", p, sizeof p); qs_get(qs, "refresh", r, sizeof r);
+    const char *user = *u ? u : g_user, *pass = *p ? p : g_pass;
+    Prof pr; time_t age = 0, now = time(NULL);
+    int ok;
+    Buf text = {0};
+    if (dump) {
+        pthread_mutex_lock(&g_prof_mtx);
+        ok = fetch_profile(user, pass, &pr, &text);
+        pthread_mutex_unlock(&g_prof_mtx);
+    } else {
+        ok = get_profile(user, pass, r[0] == '1', &pr, &age);
+    }
+    if (!ok) {
+        char msg[300]; const char *why = t_login_err[0] ? t_login_err : "could not read the PornoLab profile";
+        int n = snprintf(msg, sizeof msg, "{\"ok\":false,\"error\":\"%s\"}", why);
+        respond(fd, t_login_err[0] ? 401 : 502, "application/json", (uint8_t*)msg, (size_t)n, NULL);
+        free(text.buf); return;
+    }
+    if (dump) {
+        char path[600], reply[700]; data_path(path, sizeof path, "profile_dump.txt");
+        FILE *f = fopen(path, "w");
+        if (f) { fchmod(fileno(f), 0600); fwrite(text.buf, 1, text.len ? text.len - 1 : 0, f); fclose(f); }
+        int n = snprintf(reply, sizeof reply, "wrote %zu bytes of profile text to %s\n", text.len ? text.len - 1 : 0, path);
+        respond(fd, f ? 200 : 502, "text/plain", (uint8_t*)reply, (size_t)n, NULL);
+        free(text.buf); return;
+    }
+    Quota q = compute_quota(&pr, now);
+    Buf j = {0};
+    quota_json(&pr, &q, age, &j);
+    respond(fd, 200, "application/json", j.buf, j.len, NULL);
+    free(j.buf);
 }
 
 static void handle_ann(int fd, const char *qs) {
@@ -846,10 +1285,11 @@ static void handle_ann(int fd, const char *qs) {
 
 /* ── connection thread ───────────────────────────────────────────────────── */
 
-typedef struct { int fd; } ConnArg;
+typedef struct { int fd; int loopback; } ConnArg;
 
 static void *handle_conn(void *arg) {
     int fd = ((ConnArg *)arg)->fd;
+    t_peer_loopback = ((ConnArg *)arg)->loopback;
     free(arg);
 
     char line[4096];
@@ -877,6 +1317,8 @@ static void *handle_conn(void *arg) {
         respond(fd, 200, "text/plain", (uint8_t*)"ok", 2, NULL);
     } else if (strncmp(raw_path, "/dl/", 4) == 0) {
         handle_dl(fd, raw_path, qs, apikey_hdr[0] ? apikey_hdr : NULL);
+    } else if (strcmp(raw_path, "/quota") == 0 || strcmp(raw_path, "/quota/dump") == 0) {
+        handle_quota(fd, qs, apikey_hdr[0] ? apikey_hdr : NULL, strcmp(raw_path, "/quota/dump") == 0);
     } else if (strcmp(raw_path, "/ann") == 0) {
         handle_ann(fd, qs);
     } else {
@@ -897,6 +1339,7 @@ int main(void) {
     g_data   = getenv("PROXY_DATA_DIR")    ?: "/config/proxy";
     g_apikey = getenv("PROXY_API_KEY")     ?: "";
     g_cookie   = getenv("PORNOLAB_COOKIE")     ?: "";
+    g_quota_enforce = !(getenv("QUOTA_ENFORCE") && strcmp(getenv("QUOTA_ENFORCE"), "0") == 0);
     g_annproxy = getenv("ANNOUNCE_PROXY_URL") ?: "";
     g_annkey   = getenv("ANNOUNCE_PROXY_KEY") ?: "";
     g_port   = atoi(getenv("PROXY_PORT") ?: "8008");
@@ -922,9 +1365,11 @@ int main(void) {
     logf("listening on port %d", g_port);
 
     for (;;) {
-        int fd = accept(srv, NULL, NULL);
+        struct sockaddr_in peer; socklen_t plen = sizeof peer;
+        int fd = accept(srv, (struct sockaddr *)&peer, &plen);
         if (fd < 0) continue;
         ConnArg *a = malloc(sizeof *a); a->fd = fd;
+        a->loopback = (ntohl(peer.sin_addr.s_addr) >> 24) == 127;
         pthread_t t;
         pthread_attr_t attr; pthread_attr_init(&attr);
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
