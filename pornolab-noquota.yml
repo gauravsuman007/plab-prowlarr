@@ -241,12 +241,36 @@ search:
       filters:
         - name: querystring
           args: f
-    title:
+    _title_clean:
       selector: a.tLink
       filters:
         - name: re_replace
           args: ["(\\([\\p{IsCyrillic}\\W]+\\))|(^[\\p{IsCyrillic}\\W\\d]+\\/ )|([\\p{IsCyrillic} \\-]+,+)|([\\p{IsCyrillic}]+)", "{{ if .Config.stripcyrillic }}{{ else }}$1$2$3$4{{ end }}"]
         - name: trim
+    # "RUS DUB" when the title says the audio is a Russian voiceover. Uploaders mark subtitle languages
+    # next to "sub" ("[rus sub]", "sub[rus, eng]", "с русскими субтитрами"), so those are removed first;
+    # any "rus" left over, or a voiceover word (озвучка, закадровый, многоголосый, русский перевод...), means audio.
+    _dub:
+      selector: a.tLink
+      optional: true
+      filters:
+        - name: re_replace
+          args: ['(?i)\bsub(?:s|titles?)?\s*[\[(][^\])]*[\])]', ' ']
+        - name: re_replace
+          args: ['(?i)\b(?:rus(?:sian)?|eng(?:lish)?|ru|en)[\s_-]*sub(?:s|titles?)?\b', ' ']
+        - name: re_replace
+          args: ['(?i)\bsub(?:s|titles?)?[\s:_-]*(?:rus(?:sian)?|ru)\b', ' ']
+        - name: re_replace
+          args: ['(?i)(?:с|c)\s+русскими\s+субтитрами|русски\w*\s+субтитр\w*|субтитр\w*\s+на\s+русск\w*', ' ']
+        - name: re_replace
+          args: ['(?i)^.*(?:озвуч|закадров|одноголос|двухголос|многоголос|дубляж|дублир|русск\w*\s+перевод|автоматическ\w*\s+(?:русск\w*\s+)?перевод|перевод\w*\s+и\s+озвуч|\brus\b).*$', 'RUS DUB']
+        - name: re_replace
+          args: ['^(?!RUS DUB$).*$', '']
+    # Russian-production sections: the original audio is Russian.
+    _ru_orig:
+      text: '{{ re_replace .Result.category "^(?!(?:1674|902|1675|36|1830|1803|1831|1877|1878|1741|1676)$).*$" "" }}'
+    title:
+      text: '{{ .Result._title_clean }}{{ if .Result._dub }} [RUS DUB]{{ else }}{{ end }}{{ if .Result._ru_orig }} [RUS]{{ else }}{{ end }}'
     details:
       selector: a.tLink
       attribute: href
